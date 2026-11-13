@@ -1,6 +1,6 @@
 # scale
 
-**Единая утилита для точной подгонки длительности аудиопотоков MP2, AC-3 и DTS Core под видеоряд.**  
+**Единая утилита для точной подгонки длительности аудиопотоков MP2, AC-3 и DTS Core под видеоряд.**
 Формат входного файла определяется автоматически. Из DTS-HD MA/HRA ядро DTS Core извлекается на лету.
 
 [Русский](#русский) · [English](#english)
@@ -257,6 +257,15 @@ scale/
 В `detect_codec()` рядом с массивом `order[]` оставлен маркер
 `FUTURE:` — там же, куда добавлять новые фабрики.
 
+Кандидаты, которые органично ложатся на текущую архитектуру:
+
+| Формат | Синхрослово | Размер кадра | Почему подходит |
+|---|---|---|---|
+| **MPEG-1 Layer I (MP1)** | `0xFFF` (11 бит) | `(12 * bitrate / sample_rate + padding) * 4` | Прямой аналог MP2: независимые кадры, фиксированное число сэмплов (384), padding учитывается побайтово. |
+| **MPEG-2 Layer II** | `0xFFF` (11 бит) | `144 * bitrate / sample_rate` | Расширение существующего MP2: те же 1152 сэмпла на кадр, но другие частоты (16/22.05/24 кГц) и расширенный набор битрейтов. |
+| **E-AC-3** | `0x0B77` | 11-битное поле `frmsiz` (в 16-битных словах) | Прямое расширение AC-3: те же 256 сэмплов на аудиоблок, 1/2/3/6 блоков на кадр. Нужно аккуратно обработать multiple substream'ы (можно ограничиться independent substream 0). |
+| **DTS Express** | `0x7FFE8001` (как DTS Core) | Поле `FSIZE` в заголовке | Тот же синкворд и структура заголовка, что у DTS Core, но профиль LBR. Можно переиспользовать существующий `DtsCodec`, добавив проверку профиля. |
+
 ## Лицензия
 
 GNU General Public License v2 или новее. Оригинальные `mp2scale` и `ac3scale` написаны Zhuo Meng в 2004 году и распространялись под той же лицензией. Поддержка DTS Core, извлечение ядра DTS-HD и переписывание на C++23 добавлены поверх этой работы; оригинальные copyright-уведомления сохранены в каждом исходном файле.
@@ -484,6 +493,15 @@ it the detector would never find the first DTS-HD frame.
 
 `detect_codec()` carries a `FUTURE:` marker next to the `order[]` array
 — that is where new factories go.
+
+Candidates that naturally fit the current architecture:
+
+| Format | Sync word | Frame size | Why it fits |
+|---|---|---|---|
+| **MPEG-1 Layer I (MP1)** | `0xFFF` (11 bits) | `(12 * bitrate / sample_rate + padding) * 4` | Direct analogue of MP2: independent frames, fixed sample count (384), padding accounted per-byte. |
+| **MPEG-2 Layer II** | `0xFFF` (11 bits) | `144 * bitrate / sample_rate` | Extension of the existing MP2: same 1152 samples per frame, but different sample rates (16/22.05/24 kHz) and an extended bitrate set. |
+| **E-AC-3** | `0x0B77` | 11-bit `frmsiz` field (in 16-bit words) | Direct extension of AC-3: same 256 samples per audio block, 1/2/3/6 blocks per frame. Multiple substreams need careful handling (independent substream 0 is a reasonable starting point). |
+| **DTS Express** | `0x7FFE8001` (as DTS Core) | `FSIZE` field in header | Same sync word and header structure as DTS Core, but the LBR profile. The existing `DtsCodec` can be reused with a profile check. |
 
 ## License
 
