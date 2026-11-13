@@ -1,0 +1,77 @@
+#pragma code_page(65001)
+// =============================================================================
+//  scale.rc.in — шаблон ресурсного файла для Windows-сборки scale.
+//
+//  CMake подставляет @PROJECT_VERSION_*@ при конфигурации и генерирует
+//  scale.rc в бинарном каталоге. Пути к манифесту и иконке берутся из
+//  @CMAKE_CURRENT_SOURCE_DIR@ (forward slashes понимают и rc.exe, и windres).
+//
+//  Содержит три ресурса:
+//    * иконку приложения (RT_GROUP_ICON, IDI_ICON1);
+//    * манифест приложения (RT_MANIFEST, ID 1);
+//    * информацию о версии (VERSIONINFO).
+// =============================================================================
+
+#include <windows.h>
+
+// -----------------------------------------------------------------------------
+// Иконка приложения.
+//
+// IDI_ICON1 — стандартный идентификатор (обычно 1). Windows Explorer
+// выбирает иконку с наименьшим ID среди RT_GROUP_ICON, поэтому 1 —
+// безопасный выбор.
+// -----------------------------------------------------------------------------
+IDI_ICON1 ICON "@CMAKE_CURRENT_SOURCE_DIR@/resources/icon.ico"
+
+// -----------------------------------------------------------------------------
+// Манифест приложения.
+//
+// RT_MANIFEST = 24, CREATEPROCESS_MANIFEST_RESOURCE_ID = 1. Именно этот
+// ресурс Windows читает при запуске exe: DPI-awareness, longPathAware,
+// supportedOS, requestedExecutionLevel.
+// -----------------------------------------------------------------------------
+1 24 "@CMAKE_CURRENT_BINARY_DIR@/scale.manifest"
+
+// -----------------------------------------------------------------------------
+// Информация о версии (VERSIONINFO).
+//
+// FILEVERSION / PRODUCTVERSION — четыре 16-битных числа через запятую.
+// @PROJECT_VERSION_MAJOR@ и т.п. подставляет configure_file(@ONLY).
+// Для версии 2.0.1 получится 2,0,1,0.
+// -----------------------------------------------------------------------------
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+FILEFLAGSMASK  0x3fL
+#ifdef _DEBUG
+FILEFLAGS      0x1L
+#else
+FILEFLAGS      0x0L
+#endif
+FILEOS         0x40004L   // VOS_NT_WINDOWS32
+FILETYPE       0x1L       // VFT_APP
+FILESUBTYPE    0x0L       // VFT2_UNKNOWN
+
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 040904b0 = американский английский, Unicode (CP1200)
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "buba5473 and AudioScale Project"
+            VALUE "FileDescription",  "Audio Stream Scaler (MP2 / AC-3 / DTS Core)"
+            VALUE "FileVersion",      "@PROJECT_VERSION@"
+            VALUE "InternalName",     "scale"
+            VALUE "LegalCopyright",   "Copyright (C) 2004 Zhuo Meng; 2024 scale contributors. GPLv2+"
+            VALUE "OriginalFilename", "scale.exe"
+            VALUE "ProductName",      "scale"
+            VALUE "ProductVersion",   "@PROJECT_VERSION@"
+            VALUE "Comments",         "Scales MP2, AC-3 and DTS Core audio streams by duplicating or dropping whole frames. DTS-HD MA/HRA input is reduced to DTS Core."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        // 0x409 = en-US, 1200 = Unicode
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,7 +1,7 @@
 /*
    dtscodec.cpp — реализация scale::Codec для DTS Coherent Acoustics.
 
-   Refactored to C++23, 2024. Distributed under GNU GPL v2 or later.
+   Distributed under GNU GPL v2 or later.
 
    Класс DtsCodec инкапсулирует всё, что относится к DTS Core, а также
    автоматическое извлечение DTS Core из DTS-HD MA/HRA:
@@ -38,18 +38,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <limits>
+#include <optional>
 #include <span>
 #include <string_view>
 
 namespace {
 
 // Единый набор using-деклараций, чтобы не квалифицировать имена
-// в каждой сигнатуре. См. предыдущую ошибку сборки, где FrameInfo
-// использовался внутри DtsCodec::frame_span без квалификации.
+// в каждой сигнатуре.
 using scale::print;
 using scale::Error;
 using scale::FrameInfo;
+using scale::detail::read_be32;
+using scale::detail::kNone;
 
 // ---------------------------------------------------------------------------
 // Таблицы DTS Core (ETSI TS 102 114)
@@ -96,14 +97,6 @@ constexpr std::size_t kMaxFrameBytes = 16384;
 // Вспомогательные функции для побитового чтения MSB-first.
 // ---------------------------------------------------------------------------
 
-// 32-битное big-endian чтение из span (для sync-слова).
-[[nodiscard]] constexpr std::uint32_t
-read_be32(std::span<const std::uint8_t> b) noexcept {
-    return (static_cast<std::uint32_t>(b[0]) << 24)
-         | (static_cast<std::uint32_t>(b[1]) << 16)
-         | (static_cast<std::uint32_t>(b[2]) << 8)
-         |  static_cast<std::uint32_t>(b[3]);
-}
 
 // Извлечение N бит, начиная с битовой позиции bitpos (MSB-first),
 // из массива байт. Используется для полей заголовка, не выровненных
@@ -156,64 +149,27 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] std::expected<FrameInfo, Error>
     parse_header(std::span<const std::uint8_t> b) const noexcept override {
-        if (b.size() < 10)
+        const auto hdr = parse_core_header(b);
+        if (!hdr) return std::unexpected(Error::BadFormat);
+
+        const std::size_t nblks = hdr->nblks;
+        const std::size_t fsize = hdr->fsize;
+
+        if (kFreqs[hdr->sfreq] == 0.0)
             return std::unexpected(Error::BadFormat);
-
-        const std::uint32_t sync = read_be32(b);
-        const bool is_16be = (sync == 0x7FFE8001u);
-        const bool is_16le = (sync == 0xFE7F0180u);
-        if (!is_16be && !is_16le)
-            return std::unexpected(Error::BadFormat);
-
-        // Заголовок начинается сразу после 4-байтового sync.
-        // Для 16-bit LE байты 16-битных слов идут в обратном порядке —
-        // разворачиваем их во временный буфер.
-        std::array<std::uint8_t, 8> hdr_swap{};
-        std::span<const std::uint8_t> hdr;
-        if (is_16be) {
-            hdr = b.subspan(4, 8);
-        } else {
-            for (std::size_t i = 0; i < 8; i += 2) {
-                hdr_swap[i]     = b[4 + i + 1];
-                hdr_swap[i + 1] = b[4 + i];
-            }
-            hdr = hdr_swap;
-        }
-
-        // Поля заголовка (MSB-first, от начала hdr):
-        //   bit 0     Frame Type                (1)
-        //   bit 1..5  Deficit Sample Count      (5)
-        //   bit 6     CRC Present               (1)
-        //   bit 7..13 Number of PCM Sample Blocks (7)  → NBLKS-1
-        //   bit 14..27 Primary Frame Byte Size   (14)   → FSIZE-1
-        //   bit 28..33 Audio Channel Arrangement (6)    → AMODE
-        //   bit 34..37 Core Audio Sampling Frequency (4) → SFREQ
-        //   bit 38..42 Transmission Bit Rate     (5)    → BITRATE
-        const std::size_t nblks_raw = read_bits(hdr,  7,  7);
-        const std::size_t fsize_raw = read_bits(hdr, 14, 14);
-        const std::size_t amode     = read_bits(hdr, 28,  6);
-        const std::size_t sfreq     = read_bits(hdr, 34,  4);
-        const std::size_t brate     = read_bits(hdr, 38,  5);
-
-        const std::size_t nblks = nblks_raw + 1;   // 1..128
-        const std::size_t fsize = fsize_raw + 1;   // 1..16384
-
-        if (sfreq >= kFreqs.size() || kFreqs[sfreq] == 0.0)
-            return std::unexpected(Error::BadFormat);
-        if (brate >= kBitrates.size() || kBitrates[brate] == 0)
+        if (kBitrates[hdr->brate] == 0)
             return std::unexpected(Error::BadFormat);
         if (fsize < kMinFrameBytes || fsize > kMaxFrameBytes)
-            return std::unexpected(Error::BadFormat);
-        if (amode > 63)
             return std::unexpected(Error::BadFormat);
 
         const std::size_t samples_per_frame = nblks * 32;
 
         FrameInfo fi{};
         fi.framebytes   = fsize;
-        fi.framesec     = static_cast<double>(samples_per_frame) / kFreqs[sfreq];
-        fi.freq_khz     = kFreqs[sfreq] / 1000.0;
-        fi.bitrate_kbps = kBitrates[brate];
+        fi.framesec     = static_cast<double>(samples_per_frame)
+                        / kFreqs[hdr->sfreq];
+        fi.freq_khz     = kFreqs[hdr->sfreq] / 1000.0;
+        fi.bitrate_kbps = kBitrates[hdr->brate];
         return fi;
     }
 
@@ -232,29 +188,28 @@ public:
     //   * Slow path: сканируем буфер начиная с core+1 до ближайшего sync.
     //   * Если sync не найден — возвращаем SIZE_MAX, движок должен
     //     дозаполнить буфер.
-    //
-    // Обратите внимание на квалификацию scale::FrameInfo — тип определён
-    // в пространстве scale, а DtsCodec находится в анонимном namespace.
-    // Без этой квалификации GCC 16+ выдаёт "'FrameInfo' does not name a type".
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t
     frame_span(std::span<const std::uint8_t> buf,
                const scale::FrameInfo& fi) const noexcept override {
-        constexpr std::size_t kNone = std::numeric_limits<std::size_t>::max();
         const std::size_t core = fi.framebytes;
 
-        // Недостаточно данных, чтобы хотя бы проверить границу ядра.
         if (core + 4 > buf.size()) return kNone;
-
-        // Fast path: чистый DTS Core.
         if (has_sync(buf.subspan(core))) return core;
 
-        // Slow path: DTS-HD MA/HRA — ищем следующий DTS Core sync.
-        // Начинаем с core+1, потому что позицию core мы уже проверили.
-        for (std::size_t j = core + 1; j + 4 <= buf.size(); ++j) {
-            if (has_sync(buf.subspan(j))) return j;
+        for (std::size_t j = core + 1; j + 10 <= buf.size(); ++j) {
+            auto view = buf.subspan(j);
+            if (has_sync(view) && parse_header(view)) return j;
         }
         return kNone;
+    }
+
+    // -----------------------------------------------------------------------
+    // DTS-HD MA/HRA содержит XLL/X96 extension после ядра,
+    // поэтому проверка «следующий sync сразу за ядром» неприменима.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] bool has_extension() const noexcept override {
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -262,38 +217,67 @@ public:
     // -----------------------------------------------------------------------
     void print_info(std::span<const std::uint8_t> b,
                     const scale::FrameInfo& fi) const override {
-        if (b.size() < 10) return;
+        const auto hdr = parse_core_header(b);
+        if (!hdr) return;
+
+        const std::size_t nch = kAmodeChannels[hdr->amode & 0x0F];
+        const bool        lfe = (hdr->amode & 0x10) != 0;
+
+        print("Audio type is DTS, {}, {} channel(s){}, {} samples per frame, "
+              "sampling freq is {} kHz, and bitrate is {} kbps.\n",
+              hdr->is_16le ? "16-bit LE" : "16-bit BE",
+              nch, lfe ? ".1" : "",
+              hdr->nblks * 32,
+              fi.freq_khz, fi.bitrate_kbps);
+    }
+
+private:
+    // -----------------------------------------------------------------------
+    // Единый разбор 4-байтного sync + 6-байтного заголовка DTS Core.
+    // Возвращает nullopt, если sync не распознан или буфер слишком мал.
+    //
+    // Для 16-bit LE байты 16-битных слов идут в обратном порядке —
+    // разворачиваем их во временный массив внутри структуры, чтобы
+    // возвращаемый span не висел на локальном буфере.
+    // -----------------------------------------------------------------------
+    struct CoreHeader {
+        bool        is_16le = false;
+        std::size_t nblks   = 0;   // 1..128
+        std::size_t fsize   = 0;   // 1..16384
+        std::size_t amode   = 0;   // 6 бит
+        std::size_t sfreq   = 0;   // 4 бита
+        std::size_t brate   = 0;   // 5 бит
+    };
+
+    [[nodiscard]] static std::optional<CoreHeader>
+    parse_core_header(std::span<const std::uint8_t> b) noexcept {
+        if (b.size() < 10) return std::nullopt;
 
         const std::uint32_t sync = read_be32(b);
         const bool is_16be = (sync == 0x7FFE8001u);
         const bool is_16le = (sync == 0xFE7F0180u);
-        if (!is_16be && !is_16le) return;
+        if (!is_16be && !is_16le) return std::nullopt;
 
-        // Разворачиваем 16-битные слова для LE-варианта.
-        std::array<std::uint8_t, 8> hdr_swap{};
+        std::array<std::uint8_t, 6> hdr_swap{};
         std::span<const std::uint8_t> hdr;
         if (is_16be) {
-            hdr = b.subspan(4, 8);
+            hdr = b.subspan(4, 6);
         } else {
-            for (std::size_t i = 0; i < 8; i += 2) {
+            for (std::size_t i = 0; i < 6; i += 2) {
                 hdr_swap[i]     = b[4 + i + 1];
                 hdr_swap[i + 1] = b[4 + i];
             }
             hdr = hdr_swap;
         }
 
-        const std::size_t nblks = read_bits(hdr,  7,  7) + 1;
-        const std::size_t amode = read_bits(hdr, 28,  6);
-
-        const std::size_t nch = kAmodeChannels[amode & 0x0F];
-        const bool        lfe = (amode & 0x10) != 0;
-
-        print("Audio type is DTS, {}, {} channel(s){}, {} samples per frame, "
-              "sampling freq is {} kHz, and bitrate is {} kbps.\n",
-              is_16le ? "16-bit LE" : "16-bit BE",
-              nch, lfe ? ".1" : "",
-              nblks * 32,
-              fi.freq_khz, fi.bitrate_kbps);
+        CoreHeader out;
+        out.is_16le = is_16le;
+        out.nblks   = read_bits(hdr,  7,  7) + 1;
+        out.fsize   = read_bits(hdr, 14, 14) + 1;
+        out.amode   = read_bits(hdr, 28,  6);
+        out.sfreq   = read_bits(hdr, 34,  4);
+        out.brate   = read_bits(hdr, 38,  5);
+        return out;
     }
 };
 

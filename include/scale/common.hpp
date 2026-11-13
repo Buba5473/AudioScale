@@ -1,9 +1,9 @@
 #pragma once
 /*
-   mp2scale / ac3scale / dtsscale — общий заголовок.
+   scale — общий заголовок.
 
    Copyright (c) 2004, by Zhuo Meng (zhuo@thunder.cwru.edu).
-   Refactored to C++23, 2024. Distributed under GNU GPL v2 or later.
+   Distributed under GNU GPL v2 or later.
 
    Здесь собраны:
      - типы ошибок и их строковые представления;
@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -32,15 +33,44 @@
 
 namespace scale {
 
+// Версия утилиты. Синхронизируется с project(... VERSION ...)
+// в CMakeLists.txt.
+inline constexpr std::string_view kVersion = "2.0.1";
+
+// ---------------------------------------------------------------------------
+// Internal helpers (not part of public API; may change without notice).
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+// Big-endian 32-bit read from the first 4 bytes of span.
+// Caller must ensure b.size() >= 4.
+[[nodiscard]] constexpr std::uint32_t
+read_be32(std::span<const std::uint8_t> b) noexcept {
+    return (static_cast<std::uint32_t>(b[0]) << 24)
+         | (static_cast<std::uint32_t>(b[1]) << 16)
+         | (static_cast<std::uint32_t>(b[2]) << 8)
+         |  static_cast<std::uint32_t>(b[3]);
+}
+
+
+// Sentinel returned by Codec::frame_span() when more data
+// is needed (kept alongside read_be32; single source of truth).
+inline constexpr std::size_t kNone =
+    std::numeric_limits<std::size_t>::max();
+} // namespace detail
+
 // ---------------------------------------------------------------------------
 // Ошибки
 // ---------------------------------------------------------------------------
 
 enum class Error : std::uint8_t {
     Help,          // запрошена справка (-h / --help) — не является ошибкой
+    Version,       // запрошена версия (-V / --version) — не является ошибкой
     InvalidArgs,   // некорректные аргументы командной строки
     FileOpen,      // не удалось открыть входной/выходной файл
     FileRead,      // ошибка чтения
+    FileWrite,     // ошибка записи в выходной файл
     FileSeek,      // ошибка позиционирования
     BadFormat,     // поток не распознан как MP2 / AC-3 / DTS
     TooShort,      // файл слишком мал для анализа
@@ -105,6 +135,7 @@ public:
     Codec& operator=(const Codec&) = delete;
 
     // Человекочитаемые имена: "mp2" / "ac3" / "dts" и "MP2" / "AC-3" / "DTS".
+    // name() — для отладочных сообщений, long_name() — для сводки scale_stream().
     [[nodiscard]] virtual std::string_view name()      const noexcept = 0;
     [[nodiscard]] virtual std::string_view long_name() const noexcept = 0;
 
@@ -118,6 +149,23 @@ public:
     [[nodiscard]] virtual std::expected<FrameInfo, Error>
         parse_header(std::span<const std::uint8_t> buf) const noexcept = 0;
 
+    // Признак того, что после ядра кадра может идти extension
+    // (DTS-HD MA/HRA). Движок использует его, чтобы не требовать
+    // следующий sync сразу за ядром для таких форматов.
+    //
+    // Extension point: codecs that carry extension data after the
+    // core frame (DTS-HD XLL/X96, future TrueHD, Opus-in-Ogg)
+    // override this to skip the immediate-next-sync check in
+    // find_frame() / for_each_frame().
+    [[nodiscard]] virtual bool has_extension() const noexcept {
+        return false;
+    }
+
+    // EXTENSION POINT: расстояние от текущего sync до следующего
+    // (>= fi.framebytes). Базовая реализация подходит для
+    // форматов без extension (MP2, AC-3); DTS Core
+    // переопределяет метод, чтобы пропустить XLL/X96.
+    //
     // Расстояние от текущего sync до следующего (>= fi.framebytes).
     //   * SIZE_MAX → данных недостаточно, движок должен дозаполнить буфер;
     //   * базовое поведение — вернуть fi.framebytes (MP2, AC-3);
@@ -127,7 +175,7 @@ public:
     [[nodiscard]] virtual std::size_t
         frame_span(std::span<const std::uint8_t> buf,
                    const FrameInfo& fi) const noexcept {
-        (void)buf;
+        static_cast<void>(buf);
         return fi.framebytes;
     }
 
@@ -157,16 +205,25 @@ struct Detected {
 
 // Пробует DTS → AC-3 → MP2. Для DTS-HD MA входной поток содержит
 // DTS Core в начале кадра, поэтому детектируется тем же синхрословом.
+//
+// total_size — полный размер входного файла. 0 означает head.size()
+// (head содержит весь файл). Передавайте фактический размер, когда
+// head — усечённый префикс: это позволяет find_frame() отличать
+// «кадр в конце файла» от «кадр в конце head» и распознавать
+// одиночный кадр с хвостовым мусором (relax-проход).
 [[nodiscard]] std::optional<Detected>
-    detect_codec(std::span<const std::uint8_t> head) noexcept;
+    detect_codec(std::span<const std::uint8_t> head,
+                 std::size_t total_size = 0) noexcept;
 
 // ---------------------------------------------------------------------------
 // Публичные точки входа
 // ---------------------------------------------------------------------------
 
 // Разобрать argc/argv. Возвращает Args либо:
-//   * Error::Help        — при -h / --help / отсутствии аргументов (usage уже напечатан);
-//   * Error::InvalidArgs — при некорректных опциях (usage уже напечатан).
+//   * Error::Help        — при -h / --help (usage напечатан в stdout);
+//   * Error::Version     — при -V / --version (версия напечатана в stdout);
+//   * Error::InvalidArgs — при некорректных опциях или отсутствии
+//                          входного файла (usage напечатан в stderr).
 // Обработка ошибки остаётся за вызывающим (main).
 [[nodiscard]] std::expected<Args, Error>
     parse_args(int argc, char** argv, std::string_view prg);

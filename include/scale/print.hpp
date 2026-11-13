@@ -62,6 +62,8 @@ inline void print(std::string_view fmt, Args&&... args) {
 }
 
 // --- println(FILE*, fmt, args...) ------------------------------------------
+// Mirrors std::println(FILE*, ...) API. Used internally to
+// avoid duplicating `print(...) + fputc`.
 template <class... Args>
 inline void println(std::FILE* f, std::string_view fmt, Args&&... args) {
     print(f, fmt, std::forward<Args>(args)...);

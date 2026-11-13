@@ -153,6 +153,9 @@ Write-Log "jobs=$Jobs"
 # Выбор генератора
 # -----------------------------------------------------------------------------
 if ($Ninja) {
+    if (-not ((Test-Command "cl") -or (Test-Command "clang-cl") -or (Test-Command "clang++"))) {
+        Die "Ни cl.exe, ни clang-cl.exe, ни clang++.exe не найдены в PATH. Запустите скрипт из 'x64 Native Tools Command Prompt for VS 2022'."
+    }
     if (-not (Test-Command "ninja")) {
         Die "ninja не найден в PATH. Установите Ninja или используйте VS-генератор."
     }
@@ -255,6 +258,10 @@ if (-not $Pgo) {
 
 # =============================================================================
 # PGO-цикл: generate → run → use
+#
+# Инструментированная и финальная сборки выполняются в ОДНОМ каталоге
+# ($pgoDir): GCC и Clang встраивают в .gcda/.profraw пути к объектным
+# файлам, и при смене каталога профиль не находится.
 # =============================================================================
 Write-Log "PGO-режим включён"
 
@@ -266,9 +273,9 @@ if (-not (Test-Path $Sample -PathType Leaf)) {
 }
 $Sample = (Resolve-Path $Sample).Path
 
-# Формат определяется автоматически единственным бинарником scale.
 Write-Log "Тренировочный бинарник: $MainExe (формат определится автоматически)"
 
+# Инструментированная и финальная сборки выполняются в одном каталоге.
 $pgoDir  = "build-pgo"
 $profDir = Join-Path $pgoDir "prof"
 if (-not (Test-Path $profDir)) { New-Item -ItemType Directory -Path $profDir | Out-Null }
@@ -278,31 +285,34 @@ $profDirFull = (Resolve-Path $profDir).Path
 # Определяем инструмент компиляции: MSVC cl.exe или clang-cl.exe.
 # -----------------------------------------------------------------------------
 $useClangCl = $false
-if (Test-Command "clang-cl") {
-    $cxxEnv = (& clang-cl --version 2>$null) -join "`n"
-    if ($cxxEnv -match "clang") { $useClangCl = $true }
+if ($Ninja) {
+    if ($env:CXX) {
+        # Пользователь явно задал компилятор — уважаем выбор.
+        $useClangCl = ($env:CXX -match 'clang')
+    } elseif ((Test-Command "clang-cl") -and -not (Test-Command "cl")) {
+        # cl.exe имеет приоритет как «родной» MSVC-компилятор.
+        # clang-cl используется, только если cl.exe недоступен.
+        $useClangCl = $true
+    }
 }
 
 # -----------------------------------------------------------------------------
 # Формируем флаги PGO.
-#
-# ВАЖНО: для MSVC /GL — это флаг КОМПИЛЯТОРА, а /LTCG:PGI и /LTCG:PGO —
-# флаги ЛИНКЕРА. Раньше /LTCG попадал в CMAKE_CXX_FLAGS, что вызывало
-# ошибку cl.exe. Теперь они разделены: compileFlags и linkerFlags.
 # -----------------------------------------------------------------------------
 if ($useClangCl) {
-    Write-Log "PGO через clang-cl (-fprofile-generate / -fprofile-use)"
+    Write-Log "PGO через clang-cl (-fprofile-instr-generate / -fprofile-instr-use)"
 
-    $genCompileFlags  = "-fprofile-generate=`"$profDirFull`""
-    $genLinkerFlags   = "-fprofile-generate=`"$profDirFull`""
+    # -fprofile-instr-generate не принимает каталог: конкретный .profraw
+    # задаётся переменной LLVM_PROFILE_FILE во время прогона.
+    $genCompileFlags  = "-fprofile-instr-generate"
+    $genLinkerFlags   = "-fprofile-instr-generate"
 
-    $useCompileFlags  = "-fprofile-use=`"$profDirFull`" -fprofile-correction"
-    $useLinkerFlags   = "-fprofile-use=`"$profDirFull`""
+    # Значения use-флагов формируются после merge .profraw → .profdata.
+    $useCompileFlags  = ""
+    $useLinkerFlags   = ""
 } else {
     Write-Log "PGO через MSVC (/GL → прогон → /LTCG:PGO)"
 
-    # MSVC PGO использует переменную окружения VCPROFILE_PATH —
-    # куда складывать .pgc/.pgd.
     $env:VCPROFILE_PATH = $profDirFull
 
     $genCompileFlags  = "/GL"
@@ -320,6 +330,7 @@ $genArgs = @(
     "-DCMAKE_CXX_FLAGS=$genCompileFlags",
     "-DCMAKE_EXE_LINKER_FLAGS=$genLinkerFlags",
     "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
+    "-DSCALE_PGO=ON",
     "-DSCALE_NATIVE=$(if ($Native) {'ON'} else {'OFF'})",
     "-DSCALE_WERROR=OFF",
     "-DSCALE_BUILD_TESTS=OFF"
@@ -341,14 +352,18 @@ function Invoke-Train {
     $path = Get-ExePath -base $pgoDir -cfg $Configuration -name $MainExe
     if (-not $path) { Die "Не найден тренировочный бинарник $MainExe" }
 
-    # Несколько прогонов стабилизируют профиль.
     foreach ($i in 1..3) {
+        if ($useClangCl) {
+            $env:LLVM_PROFILE_FILE = Join-Path $profDirFull "run${i}_%p.profraw"
+        }
         & $path -t $Target -o $sampleOut $Sample *> $null
         if ($LASTEXITCODE -ne 0) {
             Write-WarnMsg "Прогон $MainExe #$i завершился с кодом $LASTEXITCODE"
         }
     }
-    # Прогон без -o — покрыть ветку «только отчёт».
+    if ($useClangCl) {
+        $env:LLVM_PROFILE_FILE = Join-Path $profDirFull "report_%p.profraw"
+    }
     & $path $Sample *> $null
 
     Write-Ok "Профиль для $MainExe собран"
@@ -358,16 +373,35 @@ try {
     Invoke-Train
 } finally {
     if (Test-Path $sampleOut) { Remove-Item -Force $sampleOut }
+    if ($useClangCl) { Remove-Item Env:LLVM_PROFILE_FILE -ErrorAction SilentlyContinue }
+}
+
+# --- Шаг 2.5 (только clang-cl): merge .profraw → .profdata ------------------
+if ($useClangCl) {
+    if (-not (Test-Command "llvm-profdata")) {
+        Die "llvm-profdata не найден. Установите llvm-tools."
+    }
+    $profData = Join-Path $profDirFull "merged.profdata"
+    $rawFiles = @(Get-ChildItem -Path $profDirFull -Filter *.profraw -ErrorAction SilentlyContinue)
+    if ($rawFiles.Count -eq 0) {
+        Die "Не найдено ни одного .profraw в $profDirFull"
+    }
+    Write-Log "Объединяю $($rawFiles.Count) .profraw → $profData"
+    & llvm-profdata merge -o $profData @($rawFiles.FullName)
+    if ($LASTEXITCODE -ne 0) { Die "llvm-profdata merge не удался" }
+    $useCompileFlags = "-fprofile-instr-use=`"$profData`" -fprofile-correction"
+    $useLinkerFlags  = "-fprofile-instr-use=`"$profData`""
 }
 
 # --- Шаг 3: финальная сборка с профилем -------------------------------------
-Write-Log "[PGO 3/3] Финальная сборка с профилем в $BuildDir"
+Write-Log "[PGO 3/3] Финальная сборка с профилем в $pgoDir"
 $useArgs = @(
-    "-S", ".", "-B", $BuildDir, "-G", $Generator,
+    "-S", ".", "-B", $pgoDir, "-G", $Generator,
     "-DCMAKE_BUILD_TYPE=$Configuration",
     "-DCMAKE_CXX_FLAGS=$useCompileFlags",
     "-DCMAKE_EXE_LINKER_FLAGS=$useLinkerFlags",
     "-DSCALE_PGO=ON",
+    "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
     "-DSCALE_NATIVE=$(if ($Native) {'ON'} else {'OFF'})",
     "-DSCALE_WERROR=$(if ($Werror) {'ON'} else {'OFF'})",
     "-DSCALE_BUILD_TESTS=$(if ($Tests)  {'ON'} else {'OFF'})"
@@ -377,26 +411,46 @@ if (-not $Ninja) { $useArgs += @("-A", $Arch) }
 & cmake @useArgs
 if ($LASTEXITCODE -ne 0) { Die "cmake configure (PGO use) не удался" }
 
-& cmake --build $BuildDir --config $Configuration --parallel $Jobs
+& cmake --build $pgoDir --config $Configuration --parallel $Jobs
 if ($LASTEXITCODE -ne 0) { Die "cmake build (PGO use) не удался" }
 
 Write-Ok "PGO-сборка завершена"
 
-Write-Artifacts -base $BuildDir -cfg $Configuration -label "Артефакты (PGO)"
+Write-Artifacts -base $pgoDir -cfg $Configuration -label "Артефакты (PGO)"
 
 # -----------------------------------------------------------------------------
 # Опциональное сравнение с baseline (BENCH=1)
 # -----------------------------------------------------------------------------
 if ($env:BENCH) {
-    Write-Log "Сравнение времени работы (упрощённое):"
-    $pgoPath  = Get-ExePath -base $BuildDir      -cfg $Configuration -name $MainExe
-    $basePath = Get-ExePath -base "build-baseline" -cfg $Configuration -name $MainExe
+    Write-Log "Сравнение времени работы baseline vs PGO:"
+    $baseDir  = "build-baseline"
+    $basePath = Get-ExePath -base $baseDir -cfg $Configuration -name $MainExe
+    if (-not $basePath) {
+        Write-Log "Baseline не найден — собираю $baseDir (без PGO)"
+        $baseArgs = @(
+            "-S", ".", "-B", $baseDir, "-G", $Generator,
+            "-DCMAKE_BUILD_TYPE=$Configuration",
+            "-DSCALE_PGO=OFF",
+            "-DSCALE_NATIVE=$(if ($Native) {'ON'} else {'OFF'})",
+            "-DSCALE_WERROR=OFF",
+            "-DSCALE_BUILD_TESTS=OFF"
+        )
+        if (-not $Ninja) { $baseArgs += @("-A", $Arch) }
+        & cmake @baseArgs
+        if ($LASTEXITCODE -ne 0) { Die "cmake configure (baseline) не удался" }
+        & cmake --build $baseDir --config $Configuration --parallel $Jobs
+        if ($LASTEXITCODE -ne 0) { Die "cmake build (baseline) не удался" }
+        $basePath = Get-ExePath -base $baseDir -cfg $Configuration -name $MainExe
+    }
+    $pgoPath = Get-ExePath -base $pgoDir -cfg $Configuration -name $MainExe
     if ($pgoPath -and $basePath) {
         $t1 = (Measure-Command { & $basePath $Sample *> $null }).TotalMilliseconds
         $t2 = (Measure-Command { & $pgoPath  $Sample *> $null }).TotalMilliseconds
-        Write-Host ("  {0,-12} baseline={1,8:N0} ms  pgo={2,8:N0} ms" -f $MainExe, $t1, $t2)
+        $speedup = if ($t2 -gt 0) { "{0:N2}x" -f ($t1 / $t2) } else { "n/a" }
+        Write-Host ("  {0,-12} baseline={1,8:N0} ms  pgo={2,8:N0} ms  speedup={3}" -f `
+                     $MainExe, $t1, $t2, $speedup)
     } else {
-        Write-WarnMsg "Для BENCH нужны и build-baseline/, и $BuildDir/"
+        Write-WarnMsg "Не удалось получить пути к baseline/pgo бинарникам"
     }
 }
 

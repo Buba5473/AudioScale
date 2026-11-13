@@ -2,7 +2,7 @@
    mp2codec.cpp — реализация scale::Codec для MPEG-1 Layer II.
 
    Copyright (c) 2004, by Zhuo Meng (zhuo@thunder.cwru.edu).
-   Refactored to C++23, 2024. Distributed under GNU GPL v2 or later.
+   Distributed under GNU GPL v2 or later.
 
    Класс Mp2Codec инкапсулирует всё, что относится к формату MP2:
      - синхрослово 0xFFF и его проверку;
@@ -31,7 +31,7 @@
 namespace {
 
 // Единый набор using-деклараций, чтобы не квалифицировать имена в каждой
-// сигнатуре (см. предыдущую ошибку сборки в dtscodec.cpp).
+// сигнатуре.
 using scale::print;
 using scale::Error;
 using scale::FrameInfo;
@@ -94,7 +94,9 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] std::expected<FrameInfo, Error>
     parse_header(std::span<const std::uint8_t> b) const noexcept override {
-        if (b.size() < 4)
+        // Синхрослово обязательно: иначе мусор мог бы пройти как
+        // заголовок Layer II (см. потерю sync в for_each_frame).
+        if (b.size() < 4 || !has_sync(b))
             return std::unexpected(Error::BadFormat);
 
         const std::uint8_t b1 = b[1];
@@ -106,13 +108,20 @@ public:
         if (layer != 2)
             return std::unexpected(Error::BadFormat);
 
+        // Таблицы ниже — для MPEG-1. MPEG-2/2.5 Layer II использует
+        // другой набор битрейтов; такой поток здесь не поддержан.
+        if (((b1 >> 3) & 0x03) != 0x03)
+            return std::unexpected(Error::BadFormat);
+
         // Индексы битрейта / частоты / padding.
-        const std::size_t brInd   = (b2 & 0xF0) >> 4;
-        const std::size_t freqInd = (b2 & 0x0C) >> 2;
+        const std::size_t brInd   =
+            static_cast<std::size_t>((b2 & 0xF0u) >> 4);
+        const std::size_t freqInd =
+            static_cast<std::size_t>((b2 & 0x0Cu) >> 2);
         const bool        pad     = (b2 & 0x02) != 0;
 
         // Валидация индексов — иначе OOB по массивам и деление на ноль.
-        if (brInd >= kBitrates.size() || kBitrates[brInd] == 0)
+        if (kBitrates[brInd] == 0)
             return std::unexpected(Error::BadFormat);
         if (freqInd >= 3 || kFreqs[freqInd] == 0.0)
             return std::unexpected(Error::BadFormat);
@@ -162,13 +171,17 @@ public:
 
         // MPEG audio version: 00=2.5, 01=reserved, 10=MPEG-2, 11=MPEG-1.
         // Оригинал работал только с MPEG-1, но формат сводки сохраняем.
-        const int mpgv     = 2 - ((b1 & 0x08) >> 3);   // 2 => MPEG-2, 1 => MPEG-1
+        // MPEG audio version (bits 4..3 of b1):
+        //   00 = MPEG-2.5, 01 = reserved, 10 = MPEG-2, 11 = MPEG-1
+        static constexpr std::array<const char*, 4> kMpegVerNames = {
+            "2.5", "reserved", "2", "1"
+        };
+        const std::size_t verBits = (b1 >> 3) & 0x03;
+        const char* mpgv = kMpegVerNames[verBits];
         const int protect  = 1 - (b1 & 0x01);          // 1 => есть CRC
 
         // Channel mode (биты 7..6 третьего байта):
         //   00 stereo, 01 joint stereo, 10 dual channel, 11 mono.
-        // Исправлено: было `(b3 && 0xC0) >> 6` — логическое И вместо
-        // побитового; из-за этого режим всегда выводился как "stereo".
         const int chanmode = (b3 & 0xC0) >> 6;
 
         print("Audio type is MPEG-{}, Layer 2, ", mpgv);

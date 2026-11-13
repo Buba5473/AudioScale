@@ -58,7 +58,6 @@ MAIN_EXE="scale"
 # -----------------------------------------------------------------------------
 BUILD_TYPE="Release"
 BUILD_DIR="${BUILD_DIR:-build}"
-PGO_DIR="${PGO_DIR:-build-pgo}"
 PGO=0
 CLEAN=0
 NATIVE=0
@@ -93,8 +92,8 @@ done
 # Чистка
 # -----------------------------------------------------------------------------
 if [[ "$CLEAN" -eq 1 ]]; then
-    log "Удаляю каталоги сборки: ${BUILD_DIR}, ${PGO_DIR}"
-    rm -rf -- "$BUILD_DIR" "$PGO_DIR"
+    log "Удаляю каталог сборки: ${BUILD_DIR}"
+    rm -rf -- "$BUILD_DIR"
     ok "Готово"
     exit 0
 fi
@@ -202,30 +201,45 @@ fi
 
 # =============================================================================
 # PGO-цикл: generate → run → use
+#
+# Инструментированная и финальная сборки выполняются в ОДНОМ каталоге
+# ($BUILD_DIR): GCC и Clang встраивают в .gcda/.profraw пути к объектным
+# файлам, и при смене каталога профиль не находится.
 # =============================================================================
 log "PGO-режим включён"
+
 [[ -n "$SAMPLE_INPUT" ]] || die "Для PGO укажите --sample <файл.mp2|файл.ac3|файл.dts>"
 [[ -f "$SAMPLE_INPUT" ]]  || die "Sample-файл не найден: $SAMPLE_INPUT"
 
+PROF_DIR="${BUILD_DIR}/prof"
+mkdir -p "$PROF_DIR"
+
 log "Тренировочный бинарник: ${MAIN_EXE} (формат определяется автоматически)"
 
+IS_CLANG=0
+[[ "$CXX_BIN" == *clang* ]] && IS_CLANG=1
+
 # --- Шаг 1: сборка с инструментированием -------------------------------------
-log "[PGO 1/3] Сборка с -fprofile-generate в ${PGO_DIR}"
-if [[ "$CXX_BIN" == *clang* ]]; then
-    PGO_GEN_FLAGS=(-fprofile-generate="${PWD}/${PGO_DIR}/prof")
-    PGO_GEN_LDFLAGS=(-fprofile-generate="${PWD}/${PGO_DIR}/prof")
+log "[PGO 1/3] Сборка с инструментированием в ${BUILD_DIR}"
+if [[ "$IS_CLANG" -eq 1 ]]; then
+    # Clang: -fprofile-instr-generate без пути; конкретное имя .profraw
+    # задаётся переменной LLVM_PROFILE_FILE во время прогона.
+    PGO_GEN_FLAGS=(-fprofile-instr-generate)
+    PGO_GEN_LDFLAGS=(-fprofile-instr-generate)
 else
-    PGO_GEN_FLAGS=(-fprofile-generate)
-    PGO_GEN_LDFLAGS=(-fprofile-generate)
+    # GCC: -fprofile-generate=<dir> задаёт каталог для .gcda.
+    PGO_GEN_FLAGS=(-fprofile-generate="${PWD}/${PROF_DIR}")
+    PGO_GEN_LDFLAGS=(-fprofile-generate="${PWD}/${PROF_DIR}")
 fi
 
-cmake -S . -B "$PGO_DIR" -G "$GENERATOR" \
+cmake -S . -B "$BUILD_DIR" -G "$GENERATOR" \
     "${COMMON_FLAGS[@]}" \
+    -DSCALE_PGO=ON \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
     -DCMAKE_CXX_FLAGS="${PGO_GEN_FLAGS[*]}" \
-    -DCMAKE_EXE_LINKER_FLAGS="${PGO_GEN_LDFLAGS[*]}" \
-    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF
+    -DCMAKE_EXE_LINKER_FLAGS="${PGO_GEN_LDFLAGS[*]}"
 
-cmake --build "$PGO_DIR" --parallel "$JOBS"
+cmake --build "$BUILD_DIR" --parallel "$JOBS"
 
 # --- Шаг 2: прогон на sample-файле -------------------------------------------
 log "[PGO 2/3] Прогон на ${SAMPLE_INPUT} (target=${SAMPLE_TARGET}s)"
@@ -233,35 +247,50 @@ SAMPLE_OUT="$(mktemp -t pgo_XXXXXX.out)"
 trap 'rm -f "$SAMPLE_OUT"' EXIT
 
 run_train() {
-    local path="$PGO_DIR/$MAIN_EXE"
-    [[ -x "$path" ]] || path="$PGO_DIR/$BUILD_TYPE/$MAIN_EXE"
+    local path="$BUILD_DIR/$MAIN_EXE"
+    [[ -x "$path" ]] || path="$BUILD_DIR/$BUILD_TYPE/$MAIN_EXE"
     [[ -x "$path" ]] || die "Не найден тренировочный бинарник: $MAIN_EXE"
 
-    # Несколько прогонов — стабильнее профиль.
     local i
-    for i in 1 2 3; do
-        "$path" -t "$SAMPLE_TARGET" -o "$SAMPLE_OUT" "$SAMPLE_INPUT" >/dev/null
-    done
-    # Прогон без -o, чтобы покрыть ветку «только отчёт».
-    "$path" "$SAMPLE_INPUT" >/dev/null
+    if [[ "$IS_CLANG" -eq 1 ]]; then
+        for i in 1 2 3; do
+            LLVM_PROFILE_FILE="${PWD}/${PROF_DIR}/run${i}_%p.profraw" \
+                "$path" -t "$SAMPLE_TARGET" -o "$SAMPLE_OUT" "$SAMPLE_INPUT" >/dev/null
+        done
+        LLVM_PROFILE_FILE="${PWD}/${PROF_DIR}/report_%p.profraw" \
+            "$path" "$SAMPLE_INPUT" >/dev/null
+    else
+        for i in 1 2 3; do
+            "$path" -t "$SAMPLE_TARGET" -o "$SAMPLE_OUT" "$SAMPLE_INPUT" >/dev/null
+        done
+        "$path" "$SAMPLE_INPUT" >/dev/null
+    fi
     ok "Профиль для $MAIN_EXE собран"
 }
 
 run_train
 
 # --- Шаг 3: финальная сборка с использованием профиля ------------------------
-log "[PGO 3/3] Финальная сборка с -fprofile-use в ${BUILD_DIR}"
-if [[ "$CXX_BIN" == *clang* ]]; then
-    PGO_USE_FLAGS=(-fprofile-use="${PWD}/${PGO_DIR}/prof" -fprofile-correction)
-    PGO_USE_LDFLAGS=(-fprofile-use="${PWD}/${PGO_DIR}/prof")
+log "[PGO 3/3] Финальная сборка с профилем в ${BUILD_DIR}"
+if [[ "$IS_CLANG" -eq 1 ]]; then
+    command -v llvm-profdata >/dev/null 2>&1 \
+        || die "llvm-profdata не найден. Установите llvm (llvm-tools)."
+    PGO_DATA="${PWD}/${PROF_DIR}/merged.profdata"
+    llvm-profdata merge -o "$PGO_DATA" \
+        "${PROF_DIR}"/*.profraw \
+        || die "llvm-profdata merge не удался"
+    PGO_USE_FLAGS=(-fprofile-instr-use="$PGO_DATA" -fprofile-correction)
+    PGO_USE_LDFLAGS=(-fprofile-instr-use="$PGO_DATA")
 else
-    PGO_USE_FLAGS=(-fprofile-use -fprofile-correction -Wno-missing-profile)
-    PGO_USE_LDFLAGS=(-fprofile-use)
+    PGO_USE_FLAGS=(-fprofile-use="${PWD}/${PROF_DIR}"
+                   -fprofile-correction -Wno-missing-profile)
+    PGO_USE_LDFLAGS=(-fprofile-use="${PWD}/${PROF_DIR}")
 fi
 
 cmake -S . -B "$BUILD_DIR" -G "$GENERATOR" \
     "${COMMON_FLAGS[@]}" \
     -DSCALE_PGO=ON \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
     -DCMAKE_CXX_FLAGS="${PGO_USE_FLAGS[*]}" \
     -DCMAKE_EXE_LINKER_FLAGS="${PGO_USE_LDFLAGS[*]}"
 
@@ -275,15 +304,29 @@ print_artifacts "$BUILD_DIR" "$BUILD_TYPE" "Артефакты (PGO)"
 # Опциональное сравнение с baseline (BENCH=1)
 # -----------------------------------------------------------------------------
 if [[ -n "${BENCH:-}" ]]; then
-    log "Сравнение (упрощённое) времени работы:"
-    local_pgo="${BUILD_DIR}/${MAIN_EXE}"
-    local_base="build-baseline/${MAIN_EXE}"
-    if [[ -x "$local_base" && -x "$local_pgo" ]]; then
-        t1=$( { /usr/bin/time -f '%e' "$local_base" "$SAMPLE_INPUT" >/dev/null; } 2>&1 || true )
-        t2=$( { /usr/bin/time -f '%e' "$local_pgo"  "$SAMPLE_INPUT" >/dev/null; } 2>&1 || true )
+    log "Сравнение времени работы baseline vs PGO:"
+    BASE_DIR="build-baseline"
+    base_exe="${BASE_DIR}/${MAIN_EXE}"
+    if [[ ! -x "$base_exe" ]]; then
+        log "Baseline не найден — собираю ${BASE_DIR} (без PGO)"
+        cmake -S . -B "$BASE_DIR" -G "$GENERATOR" \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DCMAKE_CXX_COMPILER="${CXX_BIN}" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DSCALE_PGO=OFF \
+            -DSCALE_NATIVE="$([[ "$NATIVE" -eq 1 ]] && echo ON || echo OFF)" \
+            -DSCALE_WERROR=OFF \
+            -DSCALE_BUILD_TESTS=OFF
+        cmake --build "$BASE_DIR" --parallel "$JOBS"
+        base_exe="${BASE_DIR}/${MAIN_EXE}"
+    fi
+    pgo_exe="${BUILD_DIR}/${MAIN_EXE}"
+    if [[ -x "$base_exe" && -x "$pgo_exe" ]]; then
+        t1=$( { /usr/bin/time -f '%e' "$base_exe" "$SAMPLE_INPUT" >/dev/null; } 2>&1 || true )
+        t2=$( { /usr/bin/time -f '%e' "$pgo_exe"  "$SAMPLE_INPUT" >/dev/null; } 2>&1 || true )
         printf '  %-10s baseline=%ss  pgo=%ss\n' "$MAIN_EXE" "$t1" "$t2"
     else
-        warn "Для BENCH нужны и build-baseline/, и ${BUILD_DIR}/"
+        warn "Не удалось получить пути к baseline/pgo бинарникам"
     fi
 fi
 

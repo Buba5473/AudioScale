@@ -1,7 +1,7 @@
 /*
    scale — единая утилита масштабирования MP2 / AC-3 / DTS Core.
 
-   Refactored to C++23, 2024. Distributed under GNU GPL v2 or later.
+   Distributed under GNU GPL v2 or later.
 
    Единственная точка входа проекта. Формат входного файла определяется
    автоматически (см. scale::detect_codec()):
@@ -29,24 +29,20 @@
 
 #include "scale/common.hpp"
 
-#include <expected>
 #include <string_view>
 
 namespace {
 
 // ---------------------------------------------------------------------------
-// Единая точка выхода для ошибок: печатает "<prg>: <why>" в stderr
-// и возвращает код 1. Для Error::Help возвращаем 0, потому что
-// пользователь сам попросил справку — это не ошибка.
-// ---------------------------------------------------------------------------
+// Единая точка выхода для ошибок. Для Error::Help и Error::Version
+// возвращаем 0 (пользователь сам запросил справку/версию — не ошибка),
+// иначе печатаем краткую сводку в stderr и возвращаем 1. Детальные
+// сообщения уже выведены parse_args() / scale_stream().
 [[nodiscard]] int exit_with(std::string_view prg,
-                            scale::Error   e,
+                            scale::Error      e,
                             std::string_view why) noexcept {
-    if (e == scale::Error::Help) {
-        // usage уже напечатан в parse_args(); дополнительных сообщений
-        // не требуется, возвращаем успешный код.
+    if (e == scale::Error::Help || e == scale::Error::Version)
         return 0;
-    }
     scale::print(stderr, "{}: {}\n", prg, why);
     return 1;
 }
@@ -63,10 +59,9 @@ int main(int argc, char** argv) {
 
     // -----------------------------------------------------------------------
     // 1. Разбор аргументов.
-    //    parse_args() сам печатает usage при -h/--help и при некорректных
-    //    опциях; Error::Help возвращает для обеих ситуаций, но мы
-    //    различаем их по контексту: при явном запросе справки код выхода 0,
-    //    при ошибке аргументов — 1.
+    //    parse_args() возвращает Error::Help при явном запросе
+    //    справки (-h/--help), Error::Version — при -V/--version (версия
+    //    уже напечатана), Error::InvalidArgs — при некорректных опциях.
     // -----------------------------------------------------------------------
     auto args = scale::parse_args(argc, argv, prg);
     if (!args) {

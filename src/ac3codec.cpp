@@ -2,7 +2,7 @@
    ac3codec.cpp — реализация scale::Codec для AC-3 (Dolby Digital).
 
    Copyright (c) 2004, by Zhuo Meng (zhuo@thunder.cwru.edu).
-   Refactored to C++23, 2024. Distributed under GNU GPL v2 or later.
+   Distributed under GNU GPL v2 or later.
 
    Класс Ac3Codec инкапсулирует всё, что относится к формату AC-3:
      - синхрослово 0x0B77 и его проверку;
@@ -12,9 +12,7 @@
        конфигурация каналов, LFE).
 
    Таблицы соответствуют ATSC A/52 (AC-3), §5.3 "Sync Frame".
-   Размеры кадра заданы отдельно для 48, 44.1 и 32 кГц — это устраняет
-   ошибку предыдущей версии, где для 44.1 и 32 кГц использовались
-   некорректные формулы, дававшие абсурдно малые значения.
+   Размеры кадра заданы отдельно для 48, 44.1 и 32 кГц.
 */
 
 #include "scale/common.hpp"
@@ -64,9 +62,6 @@ constexpr std::size_t kMaxFrameBytes = 3840;
 // Колонки: 48 кГц, 44.1 кГц, 32 кГц.
 //
 // Источник: ATSC A/52 §5.3 (совпадает с ff_ac3_frame_size_tab из FFmpeg).
-// Раньше для 44.1 и 32 кГц использовались некорректные формулы,
-// дававшие абсурдно малые значения (например, 1 слово вместо ~70),
-// из-за чего AC-3 на этих частотах вообще не масштабировался.
 constexpr std::array<std::array<std::size_t, 3>, 38> kFrameSizeWords = {{
     {  64,  69,  96 }, {  64,  70,  96 },
     {  80,  87, 120 }, {  80,  88, 120 },
@@ -127,14 +122,22 @@ public:
         using scale::Error;
         using scale::FrameInfo;
 
-        if (b.size() < 8)
+        // Синхрослово обязательно + отсекаем E-AC-3 по bsid (16).
+        if (b.size() < 8 || !has_sync(b))
+            return std::unexpected(Error::BadFormat);
+
+        // bsid 0..10 — AC-3, 16 — E-AC-3, остальные — резерв.
+        // E-AC-3 имеет иную структуру кадра; здесь не поддержан.
+        if (((b[5] & 0xF8u) >> 3) > 10)
             return std::unexpected(Error::BadFormat);
 
         // Байт 4: fscod в старших 2 битах, frmsizecod в младших 6.
         const std::uint8_t b4 = b[4];
 
-        const std::size_t fscod      = (b4 & 0xC0) >> 6;
-        const std::size_t frmsizecod = b4 & 0x3F;
+        const std::size_t fscod      =
+            static_cast<std::size_t>((b4 & 0xC0u) >> 6);
+        const std::size_t frmsizecod =
+            static_cast<std::size_t>(b4 & 0x3Fu);
 
         // Валидация индексов — иначе OOB и деление на ноль.
         if (fscod >= 3 || kFreqs[fscod] == 0.0)
@@ -179,9 +182,12 @@ public:
         const std::uint8_t b5 = b[5];
         const std::uint8_t b6 = b[6];
 
-        const std::size_t ac3v  = (b5 & 0xF8) >> 3;   // bsid, обычно 8 (AC-3) или 6 (ранний)
-        const std::size_t bsmod = b5 & 0x07;
-        const std::size_t acmod = (b6 & 0xE0) >> 5;
+        const std::size_t ac3v  =
+            static_cast<std::size_t>((b5 & 0xF8u) >> 3);
+        const std::size_t bsmod =
+            static_cast<std::size_t>(b5 & 0x07u);
+        const std::size_t acmod =
+            static_cast<std::size_t>((b6 & 0xE0u) >> 5);
 
         // Режимы каналов AC-3 (acmod, 3 бита):
         //   0 = 1+1 (Ch1,Ch2)
@@ -208,8 +214,9 @@ public:
         //   acmod 3/1  — сдвиг 3;
         //   acmod 2/2  — сдвиг 3 (2 бита dsurmod);
         //   acmod 3/2  — сдвиг 2 (cmixlev + surmixlev).
-        // Упрощённо: bitshift начинается с 4 и уменьшается на 2 за каждый
-        // присутствующий многоуровневый параметр.
+        // Каждое присутствующее 2-битное поле (cmixlev, surmixlev,
+        // dsurmod) сдвигает lfeon на 2 бита вправо относительно
+        // конца acmod (старшие 3 бита байта 6).
         std::size_t shift = 4;
         if ((acmod & 0x01) && acmod != 0x01) shift -= 2;   // cmixlev
         if ((acmod & 0x04) || acmod == 0x02) shift -= 2;   // surmixlev / dsurmod
